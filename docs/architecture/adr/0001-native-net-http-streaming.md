@@ -9,7 +9,7 @@ Orbit Realtime has a Python implementation integrated with Orbit Core's ASGI res
 
 ## Decision
 
-Expose bounded SSE framing plus a net/http handler that calls a synchronous producer callback. Each emitted frame is written and flushed before the producer can emit another, with no internal queue. The producer owns cancellation and upstream resource cleanup. The package sets content type, cache control, and nosniff headers and returns sanitized pre-stream failures.
+Expose bounded SSE framing plus a net/http handler that calls a synchronous producer callback. Each emitted frame is written and flushed before its emit call returns, with no internal queue. Emitter calls are serialized, and the emitter is canceled when the producer returns. The producer owns upstream resource cleanup and joins any goroutines that emit. SSE headers are committed on the first frame; pre-stream failures return a sanitized plain-text response.
 
 ## Consequences
 

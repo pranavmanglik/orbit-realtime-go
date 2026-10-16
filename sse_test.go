@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	realtime "github.com/orbit-projects/orbit-realtime-go"
@@ -38,6 +39,21 @@ func TestEventEncodingAndBounds(t *testing.T) {
 	}
 }
 
+func TestExplicitEmptyOptionalFieldsMatchPythonAndRustContracts(t *testing.T) {
+	event := (realtime.Event{Data: "payload"}).WithEvent("").WithID("")
+	frame, err := event.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "event: \nid: \ndata: payload\n\n"
+	if string(frame) != want {
+		t.Fatalf("empty event and ID fields should retain their protocol meaning: %q", frame)
+	}
+	if got := event.String(); !strings.Contains(got, "event_set:true") || !strings.Contains(got, "id_set:true") {
+		t.Fatalf("String should report explicit optional-field presence without values: %q", got)
+	}
+}
+
 func TestHandlerStreamsAndFlushes(t *testing.T) {
 	h, err := realtime.NewHandler(func(ctx context.Context, emit realtime.Emit) error {
 		return emit(realtime.Event{Data: "hello"})
@@ -53,8 +69,11 @@ func TestHandlerStreamsAndFlushes(t *testing.T) {
 	if got := r.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
 		t.Fatalf("content type = %q", got)
 	}
-	if got := r.Header().Get("Cache-Control"); got != "no-cache" {
+	if got := r.Header().Get("Cache-Control"); got != "no-cache, no-transform" {
 		t.Fatalf("cache control = %q", got)
+	}
+	if got := r.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("proxy buffering = %q", got)
 	}
 	if !r.Flushed {
 		t.Fatal("event was not flushed")
@@ -93,5 +112,57 @@ func TestHandlerSanitizesProducerFailureBeforeStreaming(t *testing.T) {
 	}
 	if strings.Contains(r.Body.String(), "private provider details") {
 		t.Fatal("response leaked producer error")
+	}
+	if got := r.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("pre-stream failure has incorrect content type: %q", got)
+	}
+}
+
+func TestHandlerSerializesConcurrentEmitCalls(t *testing.T) {
+	h, err := realtime.NewHandler(func(_ context.Context, emit realtime.Emit) error {
+		var writers sync.WaitGroup
+		errors := make(chan error, 16)
+		for range 16 {
+			writers.Add(1)
+			go func() {
+				defer writers.Done()
+				errors <- emit(realtime.Event{Data: "event"})
+			}()
+		}
+		writers.Wait()
+		close(errors)
+		for err := range errors {
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRecorder()
+	h.ServeHTTP(r, httptest.NewRequest("GET", "/events", nil))
+	if got := strings.Count(r.Body.String(), "data: event\n\n"); got != 16 {
+		t.Fatalf("expected 16 complete event frames, got %d", got)
+	}
+}
+
+func TestHandlerCancelsEmitterAfterProducerReturns(t *testing.T) {
+	var emit realtime.Emit
+	h, err := realtime.NewHandler(func(_ context.Context, send realtime.Emit) error {
+		emit = send
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRecorder()
+	h.ServeHTTP(r, httptest.NewRequest("GET", "/events", nil))
+	if err := emit(realtime.Event{Data: "late"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("emitter should be closed after producer returns, got %v", err)
+	}
+	if r.Body.Len() != 0 {
+		t.Fatal("emitter wrote after the handler returned")
 	}
 }
